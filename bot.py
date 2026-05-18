@@ -407,40 +407,174 @@ def cmd_status(_: str) -> str:
     )
 
 
-def cmd_dc(_: str) -> str:
-    data = api("/v1/stats/dcs")
-    if not data.get("middle_proxy_enabled"):
-        return f"🚫 middle proxy off: {esc(data.get('reason','?'))}"
+def _dc_health(dc: Dict[str, Any]) -> Tuple[str, str]:
+    """Return (icon, label) traffic-light for a DC.
 
-    rows = [f"🌐 <b>Telegram DC Connectivity</b>", HR]
-    for dc in sorted(data.get("dcs", []), key=lambda d: d.get("dc", 0)):
-        cov = dc.get("coverage_pct", 0)
-        fresh = dc.get("fresh_coverage_pct", 0)
-        rtt = dc.get("rtt_ms")
-        rtt_s = f"{rtt:.0f}ms" if rtt is not None else "—"
-        alive = dc.get("alive_writers", 0)
-        required = dc.get("required_writers", 0)
-        eps_avail = dc.get("available_endpoints", 0)
-        eps_total = len(dc.get("endpoints", []))
+    🟢 healthy (full coverage + writers + reasonable RTT)
+    🟡 high-latency (full coverage + writers but RTT > 500ms)
+    🟠 degraded (partial coverage or missing writers)
+    🔴 unhealthy (no coverage)
+    """
+    cov = dc.get("coverage_pct", 0)
+    alive = dc.get("alive_writers", 0)
+    required = dc.get("required_writers", 0)
+    rtt = dc.get("rtt_ms")
+    if cov < 50 or alive == 0:
+        return "🔴", "unhealthy"
+    if cov < 100 or alive < required:
+        return "🟠", "degraded"
+    if rtt is not None and rtt > 500:
+        return "🟡", "high latency"
+    return "🟢", "healthy"
 
-        if cov >= 100 and alive >= required:
-            icon = "✅"
-        elif cov >= 50:
-            icon = "⚠️"
-        else:
-            icon = "❌"
-        cap = " 🔒" if dc.get("floor_capped") else ""
 
-        rows.append(
-            f"\n{icon} <b>DC {dc.get('dc')}</b>{cap}  ·  rtt <code>{rtt_s}</code>  ·  load <code>{dc.get('load',0):.2f}</code>\n"
-            f"<pre>"
-            f"writers   {alive}/{required}  (floor {dc.get('floor_min',0)}-{dc.get('floor_target',0)}-{dc.get('floor_max',0)})\n"
-            f"endpoints {eps_avail}/{eps_total}\n"
-            f"coverage  {cov:5.1f}% {progress_bar(cov)}\n"
-            f"fresh     {fresh:5.1f}% {progress_bar(fresh)}"
-            f"</pre>"
+def cmd_dc(args: str) -> str:
+    """Compact DC table; /dc <num> for one-DC detail view."""
+    arg = args.strip()
+    if arg:
+        try:
+            target = int(arg)
+        except ValueError:
+            return f"❌ номер DC должен быть числом: <code>{esc(arg)}</code>"
+        return _cmd_dc_detail(target)
+
+    dcs_data = api("/v1/stats/dcs")
+    if not dcs_data.get("middle_proxy_enabled"):
+        return f"🚫 middle proxy off: {esc(dcs_data.get('reason','?'))}"
+
+    # Aggregate bound_clients per DC from the writers endpoint (the dcs API's
+    # `load` field is a TG-internal queue metric, not actual client count).
+    try:
+        writers_data = api("/v1/stats/me-writers")
+        clients_per_dc: Dict[int, int] = {}
+        for w in writers_data.get("writers", []):
+            clients_per_dc[w["dc"]] = clients_per_dc.get(w["dc"], 0) + w.get("bound_clients", 0)
+    except Exception:
+        clients_per_dc = {}
+
+    dcs = list(dcs_data.get("dcs", []))
+    total_writers = sum(d.get("alive_writers", 0) for d in dcs)
+    total_required = sum(d.get("required_writers", 0) for d in dcs)
+    total_clients = sum(clients_per_dc.values())
+    busiest = max(clients_per_dc.values(), default=0)
+
+    # Sort hottest first so the operator sees the DCs that matter at the top.
+    dcs.sort(key=lambda d: (-clients_per_dc.get(d.get("dc", 0), 0), d.get("dc", 0)))
+
+    lines = [
+        f"🌐 <b>DC Connectivity</b>",
+        (
+            f"<i>{len(dcs)} DCs · {fmt_num(total_writers)} writers "
+            f"({fmt_num(total_required)} required) · {fmt_num(total_clients)} clients</i>"
+        ),
+        HR,
+        "<pre>",
+        f"{'DC':>5}  {'RTT':>7}  {'writers':>8}  {'clients':>7}",
+        "─────────────────────────────────────",
+    ]
+    degraded: List[int] = []
+    for d in dcs:
+        dc_id = d.get("dc", 0)
+        rtt = d.get("rtt_ms")
+        rtt_s = f"{rtt:>5.0f}ms" if rtt is not None else "     —"
+        alive = d.get("alive_writers", 0)
+        required = d.get("required_writers", 0)
+        wr = f"{alive}/{required}"
+        clients = clients_per_dc.get(dc_id, 0)
+        icon, _ = _dc_health(d)
+        if icon != "🟢":
+            degraded.append(dc_id)
+        # Mark hottest (only if there are actual clients to mark).
+        marker = " 🔥" if busiest > 0 and clients == busiest else ""
+        lines.append(
+            f"{dc_id:>5}  {rtt_s:>7}  {wr:>8}  {fmt_num(clients):>7}  {icon}{marker}"
         )
-    return "".join(rows) if isinstance(rows, str) else "\n".join(rows)
+    lines.append("</pre>")
+
+    if degraded:
+        lines.append(
+            f"⚠️ degraded: <code>{', '.join(str(d) for d in degraded)}</code> — "
+            f"посмотри <code>/dc &lt;номер&gt;</code> для деталей"
+        )
+    else:
+        lines.append(
+            "<i>Подсказка: <code>/dc &lt;номер&gt;</code> — endpoints + writers по DC</i>"
+        )
+    return "\n".join(lines)
+
+
+def _cmd_dc_detail(target: int) -> str:
+    """Detailed snapshot of one DC: floor, coverage, endpoints, top writers."""
+    dcs_data = api("/v1/stats/dcs")
+    dc = next(
+        (d for d in dcs_data.get("dcs", []) if d.get("dc") == target),
+        None,
+    )
+    if not dc:
+        return f"❌ DC <code>{target}</code> не найден"
+
+    icon, label = _dc_health(dc)
+    cov = dc.get("coverage_pct", 0)
+    fresh = dc.get("fresh_coverage_pct", 0)
+    rtt = dc.get("rtt_ms")
+    rtt_s = f"{rtt:.0f}ms" if rtt is not None else "—"
+    alive = dc.get("alive_writers", 0)
+    required = dc.get("required_writers", 0)
+    f_min = dc.get("floor_min", 0)
+    f_tgt = dc.get("floor_target", 0)
+    f_max = dc.get("floor_max", 0)
+    cap = " 🔒" if dc.get("floor_capped") else ""
+
+    # Per-writer drilldown — need separate query.
+    try:
+        writers_data = api("/v1/stats/me-writers")
+        dc_writers = [w for w in writers_data.get("writers", []) if w.get("dc") == target]
+    except Exception:
+        dc_writers = []
+
+    total_clients = sum(w.get("bound_clients", 0) for w in dc_writers)
+
+    lines = [
+        f"🌐 <b>DC {target}</b>  ·  {icon} {label}",
+        HR,
+        "<pre>",
+        f"writers     {alive}/{required}",
+        f"floor       {f_min}-{f_tgt}-{f_max}{cap}",
+        f"coverage    {cov:5.1f}%  {progress_bar(cov)}",
+        f"fresh       {fresh:5.1f}%  {progress_bar(fresh)}",
+        f"endpoints   {dc.get('available_endpoints',0)}/{len(dc.get('endpoints',[]))}",
+        f"rtt         {rtt_s}",
+        f"clients     {fmt_num(total_clients)}",
+        "</pre>",
+    ]
+
+    # Endpoints with their writer count.
+    eps = dc.get("endpoints", []) or []
+    ep_w = {e["endpoint"]: e.get("active_writers", 0) for e in dc.get("endpoint_writers", []) or []}
+    if eps:
+        lines.append("<b>Endpoints</b>")
+        lines.append("<pre>")
+        for ep in eps:
+            lines.append(f"{ep:<25} {ep_w.get(ep, 0):>3} writers")
+        lines.append("</pre>")
+
+    # Top writers by client count.
+    if dc_writers:
+        lines.append(f"<b>Writers</b> ({len(dc_writers)})")
+        lines.append("<pre>")
+        # Truncate endpoint to fit narrow mobile screens.
+        for w in sorted(dc_writers, key=lambda x: -x.get("bound_clients", 0))[:10]:
+            ep = (w.get("endpoint", "") or "")[:22]
+            rtt_ema = w.get("rtt_ema_ms") or 0
+            lines.append(
+                f"#{w['writer_id']:<5} {ep:<22} "
+                f"{w.get('bound_clients', 0):>5}c {rtt_ema:>4.0f}ms"
+            )
+        if len(dc_writers) > 10:
+            lines.append(f"… ещё {len(dc_writers) - 10}")
+        lines.append("</pre>")
+
+    return "\n".join(lines)
 
 
 def cmd_me(_: str) -> str:
