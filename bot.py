@@ -108,6 +108,80 @@ def metric_one(text: str, name: str, labels: Optional[Dict[str, str]] = None) ->
     return None
 
 
+# ─── /proc/net/tcp parsing (for outbound source-IP visibility) ──────────
+
+# Telegram MTProto endpoint IP ranges (from core.telegram.org/resources/cidr.txt
+# — the same list the per-IP shaper uses). Matching by prefix is good enough
+# for counting outbound connections; we don't need RFC-perfect CIDR math.
+TG_IP_PREFIXES = (
+    "91.105.192.", "91.105.193.",
+    "91.108.4.", "91.108.5.", "91.108.6.", "91.108.7.",
+    "91.108.8.", "91.108.9.", "91.108.10.", "91.108.11.",
+    "91.108.12.", "91.108.13.", "91.108.14.", "91.108.15.",
+    "91.108.16.", "91.108.17.", "91.108.18.", "91.108.19.",
+    "91.108.20.", "91.108.21.", "91.108.22.", "91.108.23.",
+    "91.108.56.", "91.108.57.", "91.108.58.", "91.108.59.",
+    "149.154.160.", "149.154.161.", "149.154.162.", "149.154.163.",
+    "149.154.164.", "149.154.165.", "149.154.166.", "149.154.167.",
+    "149.154.168.", "149.154.169.", "149.154.170.", "149.154.171.",
+    "149.154.172.", "149.154.173.", "149.154.174.", "149.154.175.",
+    "185.76.151.",
+)
+
+
+def _decode_hex_ipv4(hex_addr: str) -> Optional[str]:
+    """/proc/net/tcp stores ipv4 as 8 hex chars in little-endian.
+    e.g. '6435902D' (LE) -> 45.144.53.100."""
+    if len(hex_addr) != 8:
+        return None
+    try:
+        b = bytes.fromhex(hex_addr)
+    except ValueError:
+        return None
+    return f"{b[3]}.{b[2]}.{b[1]}.{b[0]}"
+
+
+def outbound_to_tg_by_source_ip() -> Dict[str, int]:
+    """Read /proc/net/tcp and count ESTABLISHED outbound connections to
+    Telegram MP/DC endpoints, grouped by our local source IP.
+
+    Returns a dict {source_ip: connection_count}. Empty dict on read failure.
+    /proc/net/tcp is world-readable in every namespace the bot can see, so
+    this does not require CAP_NET_ADMIN. State 01 = ESTABLISHED.
+    """
+    counts: Dict[str, int] = {}
+    try:
+        with open("/proc/net/tcp", "r") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return counts
+    # First line is the header.
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local = parts[1]
+        remote = parts[2]
+        state = parts[3]
+        if state != "01":  # ESTABLISHED
+            continue
+        try:
+            r_ip_hex, r_port_hex = remote.split(":")
+            l_ip_hex, _ = local.split(":")
+        except ValueError:
+            continue
+        r_ip = _decode_hex_ipv4(r_ip_hex)
+        if not r_ip:
+            continue
+        if not any(r_ip.startswith(p) for p in TG_IP_PREFIXES):
+            continue
+        l_ip = _decode_hex_ipv4(l_ip_hex)
+        if not l_ip:
+            continue
+        counts[l_ip] = counts.get(l_ip, 0) + 1
+    return counts
+
+
 # ─── Telegram helpers ───────────────────────────────────────────────────
 
 def tg(method: str, **kwargs: Any) -> Dict[str, Any]:
@@ -146,7 +220,7 @@ def main_menu() -> Dict[str, Any]:
                 {"text": "🔐 Handshake", "callback_data": "handshake"},
             ],
             [
-                {"text": "♻️ Обновить", "callback_data": "menu"},
+                {"text": "🌍 Outbound IPs", "callback_data": "ips"},
                 {"text": "ℹ️ Помощь", "callback_data": "help"},
             ],
         ]
@@ -269,6 +343,7 @@ def cmd_help(_: str) -> str:
         "<b>Текстовые команды</b> — для конкретики:\n\n"
         "  <code>/user &lt;name&gt;</code> — детали по пользователю + первые 8 IP\n"
         "  <code>/metric &lt;name&gt;</code> — любая Prometheus-метрика\n"
+        "  <code>/ips</code> — распределение outbound по source IP (multi-IP setup)\n"
         "  <code>/menu</code> — показать главное меню\n"
         "  <code>/refresh</code> — обновить snapshot\n\n"
         "<i>Доступ ограничен whitelist'ом owner-ов.</i>"
@@ -291,6 +366,11 @@ def cmd_status(_: str) -> str:
     except Exception:
         pass
 
+    # Outbound source-IP count — surfaces multi-IP topology at a glance.
+    ip_counts = outbound_to_tg_by_source_ip()
+    ip_distinct = len(ip_counts)
+    ip_total_conn = sum(ip_counts.values())
+
     ready_ok = ready.get("ready", False)
     accept_ok = gates.get("accepting_new_connections", False)
     me_ok = gates.get("me_runtime_ready", False)
@@ -298,6 +378,8 @@ def cmd_status(_: str) -> str:
     health_icon = "🟢" if (ready_ok and accept_ok and me_ok) else ("🟡" if ready_ok else "🔴")
     ups_h = ready.get("healthy_upstreams", 0)
     ups_t = ready.get("total_upstreams", 0)
+
+    ip_icon = "🌍" if ip_distinct > 1 else "🌐"
 
     return (
         f"{health_icon} <b>telemt {esc(sysinfo.get('version','?'))}</b>"
@@ -309,6 +391,8 @@ def cmd_status(_: str) -> str:
         f"{'✅' if me_ok else '⏳'} me_runtime_ready\n"
         f"🔌 upstreams: <b>{ups_h}/{ups_t}</b>"
         f"  ·  route: <code>{esc(gates.get('route_mode','?'))}</code>\n"
+        f"{ip_icon} outbound: <b>{ip_distinct}</b> source IPs · "
+        f"{ip_total_conn} TG conns (см. /ips)\n"
         f"\n<b>Трафик (с момента старта)</b>\n"
         f"<pre>"
         f"active conns       {fmt_num(active):>12}  ({active_users} users)\n"
@@ -552,6 +636,52 @@ def cmd_metric(args: str) -> str:
     return "\n".join(rows)
 
 
+def cmd_ips(_: str) -> str:
+    """Outbound source-IP distribution to Telegram endpoints.
+
+    Useful for verifying multi-IP `bind_addresses` rotation and the new
+    `me_writer_bind_multiplier` feature. Each established TCP session from
+    one of our IPs to a TG endpoint counts toward that IP's bucket.
+    """
+    counts = outbound_to_tg_by_source_ip()
+    if not counts:
+        return (
+            f"🌍 <b>Outbound IPs</b>\n{HR}\n"
+            "Не удалось прочитать <code>/proc/net/tcp</code> или нет активных\n"
+            "соединений к Telegram. Бот должен жить в том же netns что и telemt."
+        )
+    total = sum(counts.values())
+    distinct = len(counts)
+
+    # Visual bar relative to busiest IP, so disuse is immediately obvious.
+    busiest = max(counts.values())
+
+    rows = [f"🌍 <b>Outbound к Telegram</b>", HR]
+    rows.append(
+        f"  {distinct} active source IP · {total} ESTABLISHED connections"
+    )
+    rows.append("<pre>")
+    rows.append(f"{'source IP':<18} {'conns':>6}  bar")
+    # Sort: most-used first.
+    for ip, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        bar_width = int(n / busiest * 12) if busiest else 0
+        bar = "█" * bar_width + "░" * (12 - bar_width)
+        rows.append(f"{ip:<18} {n:>6}  {bar}")
+    rows.append("</pre>")
+
+    # Hint about multi-IP scaling status.
+    if distinct <= 1:
+        rows.append(
+            "<i>⚠️ только один source IP — для multi-IP outbound добавь</i>\n"
+            "<i><code>[[upstreams]] bind_addresses = [...]</code></i>"
+        )
+    elif distinct >= 3:
+        rows.append(
+            f"<i>✓ multi-IP outbound: writers распределены по {distinct} source IP</i>"
+        )
+    return "\n".join(rows)
+
+
 def cmd_refresh(_: str) -> str:
     info = api("/v1/system/info")
     return (
@@ -586,6 +716,7 @@ COMMANDS: Dict[str, Callable[[str], str]] = {
     "/user": cmd_user,
     "/online": cmd_online,
     "/handshake": cmd_handshake,
+    "/ips": cmd_ips,
     "/metric": cmd_metric,
     "/refresh": cmd_refresh,
 }
@@ -599,6 +730,7 @@ CALLBACK_TO_CMD: Dict[str, str] = {
     "users": "/users",
     "online": "/online",
     "handshake": "/handshake",
+    "ips": "/ips",
     "refresh": "/refresh",
 }
 
@@ -711,6 +843,7 @@ def register_commands() -> None:
         {"command": "users", "description": "👥 Все пользователи"},
         {"command": "user", "description": "👤 Детали: /user <name>"},
         {"command": "handshake", "description": "🔐 Bad handshake breakdown"},
+        {"command": "ips", "description": "🌍 Outbound source-IP распределение"},
         {"command": "metric", "description": "📈 Любая метрика: /metric <name>"},
         {"command": "refresh", "description": "♻️ Обновить snapshot"},
         {"command": "help", "description": "ℹ️ Помощь"},
