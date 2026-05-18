@@ -1,0 +1,27 @@
+[Unit]
+Description=Telemt status Telegram bot
+After=network-online.target telemt.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telemt-bot
+Group=telemt-bot
+EnvironmentFile=/etc/telemt-bot/env
+ExecStart=/usr/bin/python3 /opt/telemt-bot/bot.py
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target

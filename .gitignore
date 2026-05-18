@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.env
+# never commit a real env file — only env.example
+etc/telemt-bot/env
