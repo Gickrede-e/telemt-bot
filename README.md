@@ -14,13 +14,15 @@ breakdowns, and any Prometheus metric on demand.
 ## Screenshots / sample renders
 
 ```
-🟢 telemt 3.4.15  ·  uptime 51m 53s
+🟢 telemt 3.4.16  ·  uptime 51m 53s
 ━━━━━━━━━━━━━━━━━━━━
 Состояние
 ✅ ready: ready
 ✅ accept_new_connections
 ✅ me_runtime_ready
 🔌 upstreams: 1/1  ·  route: middle
+🧩 shards: 6 (per-source-IP isolation) — /shards
+🌍 outbound: 6 source IPs · 1623 TG conns (см. /ips)
 
 Трафик (с момента старта)
 active conns              6 192  (1 users)
@@ -46,9 +48,11 @@ fresh     100.0% ████████████
 | Command | What it shows |
 |---|---|
 | `/menu` | Inline-keyboard main menu |
-| `/status` | Version, uptime, ready state, active connections, accept-permit-timeout |
+| `/status` | Version, uptime, ready state, active connections, **shard mode**, accept-permit-timeout |
 | `/dc` | Per-DC connectivity: writers, coverage, RTT, load |
-| `/me` | Middle-proxy pool: writers, endpoints, hardswaps, quarantines |
+| `/me` | Middle-proxy pool: writers, endpoints, hardswaps, quarantines (aggregated across shards) |
+| `/shards` | Per-source-IP shard topology + balance check (telemt Phase 2 MePoolMux) |
+| `/ips` | Outbound source-IP distribution from `/proc/net/tcp` |
 | `/users` | All configured users with traffic + IP counts |
 | `/user <name>` | Single-user detail + first 8 active IPs |
 | `/online` | Total active connections + top-10 users |
@@ -56,6 +60,36 @@ fresh     100.0% ████████████
 | `/metric <name>` | Raw value of any Prometheus metric series |
 | `/refresh` | Re-fetch snapshot |
 | `/help` | Help text |
+
+### `/shards` — Phase 2 visibility
+
+When telemt runs with `me_writer_bind_mode = "shard"` (per-source-IP
+isolation, see telemt's `docs/PERFORMANCE_AND_ANTIDETECT.ru.md` §B+), the
+bot surfaces the shard plan and a **balance check** computed from
+`/proc/net/tcp`. Coefficient-of-variation across source IPs tells you at a
+glance whether one shard is starving:
+
+```
+🧩 Шарды (MePoolMux)
+━━━━━━━━━━━━━━━━━━━━
+🧩 mode: shard · per-source-IP isolation
+  configured: 6 bind addresses · live: 6 active source IPs
+
+source IP          conns  balance
+45.144.53.142        282  ████████████
+45.144.53.77         280  ███████████░
+45.144.53.124        271  ███████████░
+45.144.53.100        264  ███████████░
+45.144.53.143        264  ███████████░
+45.144.53.36         262  ███████████░
+TOTAL               1623
+
+✓ баланс отличный (CV=2.71%)
+```
+
+The bot reads `/etc/telemt/telemt.toml` directly to know which mode is
+configured — needs group-read access (default install.sh puts the bot
+user in the `telemt` group).
 
 ## Requirements
 

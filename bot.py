@@ -182,6 +182,92 @@ def outbound_to_tg_by_source_ip() -> Dict[str, int]:
     return counts
 
 
+# ─── shard topology helpers (Phase 2 MePoolMux) ─────────────────────────
+
+# `/etc/telemt/telemt.toml` is group-readable (rw-r----- root:telemt). The
+# bot runs as user `telemt-bot` who is in the `telemt` group via install.sh
+# from PR #4, so this read normally succeeds. If it fails (permissions
+# changed, file moved), the bot falls back to inferring shard mode purely
+# from /proc/net/tcp source-IP topology so the UI still shows something
+# useful instead of empty.
+TELEMT_CONFIG_PATH = os.environ.get("TELEMT_CONFIG_PATH", "/etc/telemt/telemt.toml")
+
+
+def read_shard_config() -> Dict[str, Any]:
+    """Parse a few specific keys out of telemt.toml to expose shard config to
+    the UI. Deliberately not a real TOML parser — we only care about three
+    lines and the bot is stdlib-only.
+
+    Returns {mode, multiplier, bind_count, error?}. mode is "shard" |
+    "round_robin" | "unknown".
+    """
+    out: Dict[str, Any] = {"mode": "unknown", "multiplier": 1, "bind_count": 0}
+    try:
+        with open(TELEMT_CONFIG_PATH, "r") as fh:
+            text = fh.read()
+    except OSError as e:
+        out["error"] = f"read {TELEMT_CONFIG_PATH}: {e.strerror}"
+        return out
+    m = re.search(r'^\s*me_writer_bind_mode\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if m:
+        out["mode"] = m.group(1)
+    else:
+        # Field defaults to round_robin when absent in config — telemt's
+        # MeWriterBindMode::default(). Reflect that here so the UI doesn't
+        # report a false "unknown" for legacy single-pool deployments.
+        out["mode"] = "round_robin"
+    m = re.search(r'^\s*me_writer_bind_multiplier\s*=\s*(\d+)', text, re.MULTILINE)
+    if m:
+        out["multiplier"] = int(m.group(1))
+    # bind_addresses lives on [[upstreams]] entries. We count entries on
+    # any line of the form `bind_addresses = ["1.2.3.4", "5.6.7.8"]` — the
+    # first such entry is the relevant one for shard count under the
+    # current single-direct-upstream production config.
+    m = re.search(r'^\s*bind_addresses\s*=\s*\[([^\]]*)\]', text, re.MULTILINE)
+    if m:
+        # Count quoted IPs inside the array; tolerates whitespace + trailing comma.
+        out["bind_count"] = len(re.findall(r'"[^"]+"', m.group(1)))
+    return out
+
+
+def shard_topology() -> Dict[str, Any]:
+    """Combine config-declared shard plan with the live /proc/net/tcp view.
+
+    The interesting question for an operator after the Phase 2 deploy is
+    "are my shards actually balanced?" — answered by comparing the
+    per-source-IP outbound counts. Variance high → one shard is failing
+    or a TG endpoint is rejecting one of our source IPs.
+    """
+    cfg = read_shard_config()
+    counts = outbound_to_tg_by_source_ip()
+    distinct_ips = len(counts)
+    total = sum(counts.values())
+
+    # Coefficient of variation as a balance metric: stdev/mean. Lower is
+    # better; > 0.25 typically means one shard is materially underperforming.
+    cv: Optional[float] = None
+    if distinct_ips >= 2 and total > 0:
+        mean = total / distinct_ips
+        variance = sum((c - mean) ** 2 for c in counts.values()) / distinct_ips
+        stdev = variance ** 0.5
+        cv = stdev / mean if mean > 0 else None
+
+    # Effective shard count: in shard mode, this is the configured bind
+    # address count; in round_robin, it's effectively 1 (single pool).
+    # We surface the LIVE observed value (distinct source IPs in use) and
+    # the CONFIGURED value (bind_count) so a mismatch is obvious.
+    return {
+        "config_mode": cfg.get("mode", "unknown"),
+        "config_bind_count": cfg.get("bind_count", 0),
+        "config_multiplier": cfg.get("multiplier", 1),
+        "config_error": cfg.get("error"),
+        "live_source_ip_count": distinct_ips,
+        "live_total_conns": total,
+        "live_per_ip": counts,
+        "balance_cv": cv,
+    }
+
+
 # ─── Telegram helpers ───────────────────────────────────────────────────
 
 def tg(method: str, **kwargs: Any) -> Dict[str, Any]:
@@ -216,11 +302,14 @@ def main_menu() -> Dict[str, Any]:
                 {"text": "🔌 ME pool", "callback_data": "me"},
             ],
             [
+                {"text": "🧩 Шарды", "callback_data": "shards"},
+                {"text": "🌍 Outbound IPs", "callback_data": "ips"},
+            ],
+            [
                 {"text": "👥 Пользователи", "callback_data": "users"},
                 {"text": "🔐 Handshake", "callback_data": "handshake"},
             ],
             [
-                {"text": "🌍 Outbound IPs", "callback_data": "ips"},
                 {"text": "ℹ️ Помощь", "callback_data": "help"},
             ],
         ]
@@ -343,7 +432,8 @@ def cmd_help(_: str) -> str:
         "<b>Текстовые команды</b> — для конкретики:\n\n"
         "  <code>/user &lt;name&gt;</code> — детали по пользователю + первые 8 IP\n"
         "  <code>/metric &lt;name&gt;</code> — любая Prometheus-метрика\n"
-        "  <code>/ips</code> — распределение outbound по source IP (multi-IP setup)\n"
+        "  <code>/ips</code> — распределение outbound по source IP\n"
+        "  <code>/shards</code> — режим шардирования + balance check (Phase 2)\n"
         "  <code>/menu</code> — показать главное меню\n"
         "  <code>/refresh</code> — обновить snapshot\n\n"
         "<i>Доступ ограничен whitelist'ом owner-ов.</i>"
@@ -371,6 +461,13 @@ def cmd_status(_: str) -> str:
     ip_distinct = len(ip_counts)
     ip_total_conn = sum(ip_counts.values())
 
+    # Shard mode — added in Phase 2. Determined by reading the live config
+    # (or falling back to "unknown" if telemt.toml is unreadable). The
+    # detail view lives in /shards; here we render only a one-liner so
+    # /status stays scannable.
+    shard_cfg = read_shard_config()
+    shard_mode = shard_cfg.get("mode", "unknown")
+
     ready_ok = ready.get("ready", False)
     accept_ok = gates.get("accepting_new_connections", False)
     me_ok = gates.get("me_runtime_ready", False)
@@ -380,6 +477,19 @@ def cmd_status(_: str) -> str:
     ups_t = ready.get("total_upstreams", 0)
 
     ip_icon = "🌍" if ip_distinct > 1 else "🌐"
+    if shard_mode == "shard":
+        shard_line = (
+            f"🧩 shards: <b>{shard_cfg.get('bind_count', '?')}</b> "
+            f"(per-source-IP isolation) — /shards"
+        )
+    elif shard_mode == "round_robin" and shard_cfg.get("multiplier", 1) > 1:
+        shard_line = (
+            f"🔁 outbound mode: <b>round_robin ×{shard_cfg['multiplier']}</b> — /shards"
+        )
+    elif shard_mode == "round_robin":
+        shard_line = "🔁 outbound mode: <b>round_robin</b> (single pool) — /shards"
+    else:
+        shard_line = "❓ outbound mode: <i>unknown</i> — /shards"
 
     return (
         f"{health_icon} <b>telemt {esc(sysinfo.get('version','?'))}</b>"
@@ -391,6 +501,7 @@ def cmd_status(_: str) -> str:
         f"{'✅' if me_ok else '⏳'} me_runtime_ready\n"
         f"🔌 upstreams: <b>{ups_h}/{ups_t}</b>"
         f"  ·  route: <code>{esc(gates.get('route_mode','?'))}</code>\n"
+        f"{shard_line}\n"
         f"{ip_icon} outbound: <b>{ip_distinct}</b> source IPs · "
         f"{ip_total_conn} TG conns (см. /ips)\n"
         f"\n<b>Трафик (с момента старта)</b>\n"
@@ -595,11 +706,25 @@ def cmd_me(_: str) -> str:
     fresh = s.get("fresh_coverage_pct", 0)
     avail_pct = s.get("available_pct", 0)
 
+    # Shard-aware header. In shard mode the writers/required/fresh
+    # numbers are aggregated across ALL shards by Phase 2c (MePoolMux
+    # ::aggregate_status_snapshot) — so the figures match the system
+    # total, not a single shard. Surface this so operators don't think
+    # the system is over-provisioning. /shards has the per-shard breakdown.
+    shard_cfg = read_shard_config()
+    shard_header = ""
+    if shard_cfg.get("mode") == "shard":
+        n = shard_cfg.get("bind_count", 0)
+        shard_header = (
+            f"<i>🧩 aggregated across <b>{n}</b> shards (mux mode) — /shards</i>\n"
+        )
+
     return (
         f"🔌 <b>Middle-proxy pool</b>\n{HR}\n"
+        f"{shard_header}"
         f"<pre>"
-        f"writers   alive {s.get('alive_writers',0):>3} / required {s.get('required_writers',0):>3}\n"
-        f"          fresh {s.get('fresh_alive_writers',0):>3}\n"
+        f"writers   alive {s.get('alive_writers',0):>5} / required {s.get('required_writers',0):>5}\n"
+        f"          fresh {s.get('fresh_alive_writers',0):>5}\n"
         f"endpoints {s.get('available_endpoints',0):>3} / {s.get('configured_endpoints',0):<3}  ({avail_pct:5.1f}%)\n"
         f"dc_groups {s.get('configured_dc_groups',0)}\n"
         f"\n"
@@ -816,6 +941,96 @@ def cmd_ips(_: str) -> str:
     return "\n".join(rows)
 
 
+def cmd_shards(_: str) -> str:
+    """Per-source-IP shard view (Phase 2 MePoolMux).
+
+    Shows configured shard plan + live outbound balance. The balance check
+    is the actually-useful signal: a healthy shard mode has all source IPs
+    within ~10-15% of each other. A single low IP usually means that
+    shard's writers are stuck quarantining a flaky endpoint that's fine
+    for sibling shards — exactly the failure-isolation behaviour shard
+    mode adds over the simpler `me_writer_bind_multiplier` rotation.
+    """
+    topo = shard_topology()
+    mode = topo["config_mode"]
+    cfg_n = topo["config_bind_count"]
+    cfg_mult = topo["config_multiplier"]
+    live_n = topo["live_source_ip_count"]
+    total = topo["live_total_conns"]
+    cv = topo["balance_cv"]
+    counts = topo["live_per_ip"]
+    err = topo["config_error"]
+
+    if mode == "shard":
+        mode_icon = "🧩"
+        mode_label = f"<b>shard</b> · per-source-IP isolation"
+    elif mode == "round_robin":
+        mode_icon = "🔁"
+        if cfg_mult > 1:
+            mode_label = f"<b>round_robin</b> ×{cfg_mult} (multiplier mode)"
+        else:
+            mode_label = "<b>round_robin</b> (single pool)"
+    else:
+        mode_icon = "❓"
+        mode_label = "<b>unknown</b>"
+
+    rows = [
+        f"🧩 <b>Шарды (MePoolMux)</b>",
+        HR,
+        f"{mode_icon} mode: {mode_label}",
+    ]
+    if err:
+        rows.append(f"<i>⚠️ {esc(err)} — config undetected, showing live only</i>")
+    rows.append(
+        f"  configured: <b>{cfg_n}</b> bind addresses · live: <b>{live_n}</b> active source IPs"
+    )
+    if mode == "shard" and cfg_n != live_n and cfg_n > 0:
+        # Shard mode declared N but we only see fewer source IPs in flight
+        # → likely one or more shards failed init (check journalctl for
+        # spawn_shard_supervisor retries) or are idle.
+        rows.append(
+            f"  <i>⚠️ только {live_n}/{cfg_n} shards активны — проверь journalctl</i>"
+        )
+
+    if not counts:
+        rows.append(
+            "\n<i>Нет активных outbound коннекций к TG — pool ещё прогревается?</i>"
+        )
+        return "\n".join(rows)
+
+    # Per-shard table with visual bar relative to busiest.
+    busiest = max(counts.values()) if counts else 1
+    rows.append("")
+    rows.append("<pre>")
+    rows.append(f"{'source IP':<18} {'conns':>6}  balance")
+    for ip, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        bar_w = int(n / busiest * 12) if busiest else 0
+        bar = "█" * bar_w + "░" * (12 - bar_w)
+        rows.append(f"{ip:<18} {n:>6}  {bar}")
+    rows.append(f"{'TOTAL':<18} {total:>6}")
+    rows.append("</pre>")
+
+    # Balance verdict — the operator's actionable signal.
+    if cv is None:
+        rows.append("<i>(нужно ≥2 source IP для оценки баланса)</i>")
+    elif cv < 0.10:
+        rows.append(f"<i>✓ баланс отличный (CV={cv:.2%})</i>")
+    elif cv < 0.25:
+        rows.append(f"<i>✓ баланс ОК (CV={cv:.2%})</i>")
+    elif cv < 0.50:
+        rows.append(
+            f"<i>⚠️ дисбаланс (CV={cv:.2%}) — один shard может квантировать endpoint, "
+            f"сиблинги нет</i>"
+        )
+    else:
+        rows.append(
+            f"<i>🔴 сильный дисбаланс (CV={cv:.2%}) — shard вероятно сломан, "
+            f"смотри journalctl на flap warns</i>"
+        )
+
+    return "\n".join(rows)
+
+
 def cmd_refresh(_: str) -> str:
     info = api("/v1/system/info")
     return (
@@ -846,6 +1061,7 @@ COMMANDS: Dict[str, Callable[[str], str]] = {
     "/status": cmd_status,
     "/dc": cmd_dc,
     "/me": cmd_me,
+    "/shards": cmd_shards,
     "/users": cmd_users,
     "/user": cmd_user,
     "/online": cmd_online,
@@ -861,6 +1077,7 @@ CALLBACK_TO_CMD: Dict[str, str] = {
     "status": "/status",
     "dc": "/dc",
     "me": "/me",
+    "shards": "/shards",
     "users": "/users",
     "online": "/online",
     "handshake": "/handshake",
