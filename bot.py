@@ -944,13 +944,103 @@ def cmd_ips(_: str) -> str:
 def cmd_shards(_: str) -> str:
     """Per-source-IP shard view (Phase 2 MePoolMux).
 
-    Shows configured shard plan + live outbound balance. The balance check
-    is the actually-useful signal: a healthy shard mode has all source IPs
-    within ~10-15% of each other. A single low IP usually means that
-    shard's writers are stuck quarantining a flaky endpoint that's fine
-    for sibling shards — exactly the failure-isolation behaviour shard
-    mode adds over the simpler `me_writer_bind_multiplier` rotation.
+    Prefers the authoritative `/v1/stats/me-writers/by-shard` API (Phase
+    2d) which returns the exact per-shard writer counts that the proxy
+    itself sees. Falls back to /proc/net/tcp source-IP inference when
+    that endpoint isn't available (older telemt, API disabled).
+
+    Both paths surface the same balance check: a healthy shard mode has
+    all source IPs within ~10-15% of each other. Big imbalance usually
+    means one shard's writers are stuck quarantining a flaky endpoint
+    that's fine for sibling shards — exactly the failure-isolation
+    behaviour shard mode adds over the simpler
+    `me_writer_bind_multiplier` rotation.
     """
+    api_data: Optional[Dict[str, Any]] = None
+    try:
+        api_data = api("/v1/stats/me-writers/by-shard")
+    except Exception:
+        # Older telemt without the by-shard endpoint, or API down —
+        # fall back to /proc/net/tcp inference below.
+        api_data = None
+
+    if api_data and api_data.get("middle_proxy_enabled"):
+        return _render_shards_from_api(api_data)
+    return _render_shards_from_proc()
+
+
+def _render_shards_from_api(data: Dict[str, Any]) -> str:
+    """Render /shards from the authoritative by-shard API — single
+    source of truth: actual writer count and bind address per shard,
+    not just established TCP sockets visible to the bot."""
+    mode = data.get("mode", "unknown")
+    shards: List[Dict[str, Any]] = data.get("shards", [])
+
+    if mode == "shard":
+        mode_icon = "🧩"
+        mode_label = "<b>shard</b> · per-source-IP isolation"
+    else:
+        mode_icon = "🔁"
+        mode_label = "<b>round_robin</b> (single pool)"
+
+    rows = [f"🧩 <b>Шарды (MePoolMux)</b>", HR, f"{mode_icon} mode: {mode_label}"]
+    rows.append(f"  <b>{len(shards)}</b> shards · live writer counts from API")
+
+    if not shards:
+        rows.append("\n<i>Нет шардов в активном состоянии</i>")
+        return "\n".join(rows)
+
+    # Use alive_writers per shard for the balance check — this is what
+    # the proxy actually sees as its working pool, more precise than
+    # the established-TCP count from /proc.
+    counts = {
+        sh.get("bind_address") or f"shard-{sh.get('shard_idx', '?')}":
+            sh.get("summary", {}).get("alive_writers", 0)
+        for sh in shards
+    }
+    busiest = max(counts.values()) if counts else 1
+    total = sum(counts.values())
+
+    cv: Optional[float] = None
+    if len(counts) >= 2 and total > 0:
+        mean = total / len(counts)
+        variance = sum((c - mean) ** 2 for c in counts.values()) / len(counts)
+        cv = (variance ** 0.5) / mean if mean > 0 else None
+
+    rows.append("")
+    rows.append("<pre>")
+    rows.append(f"{'shard / bind':<22} {'writers':>7}  balance")
+    for label, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        bar_w = int(n / busiest * 12) if busiest else 0
+        bar = "█" * bar_w + "░" * (12 - bar_w)
+        rows.append(f"{label:<22} {n:>7}  {bar}")
+    rows.append(f"{'TOTAL':<22} {total:>7}")
+    rows.append("</pre>")
+
+    # Per-shard required/coverage from the API summary — these surface
+    # under/over-provisioning per shard, which /proc/net/tcp can't show.
+    rows.append("")
+    rows.append("<b>Coverage per shard</b>")
+    rows.append("<pre>")
+    rows.append(f"{'shard':<6} {'alive':>5} {'req':>5} {'cov%':>6}")
+    for sh in shards:
+        idx = sh.get("shard_idx", "?")
+        s = sh.get("summary", {})
+        alive = s.get("alive_writers", 0)
+        req = s.get("required_writers", 0)
+        cov = s.get("coverage_pct", 0.0)
+        rows.append(f"{idx:<6} {alive:>5} {req:>5} {cov:>6.1f}")
+    rows.append("</pre>")
+
+    rows.append(_balance_verdict_line(cv))
+    return "\n".join(rows)
+
+
+def _render_shards_from_proc() -> str:
+    """Fallback: infer shard view from /proc/net/tcp source-IP
+    distribution. Less authoritative (just counts established TCP
+    sockets, can't distinguish writer state) but works when the API is
+    unreachable or the new endpoint isn't deployed yet."""
     topo = shard_topology()
     mode = topo["config_mode"]
     cfg_n = topo["config_bind_count"]
@@ -978,6 +1068,7 @@ def cmd_shards(_: str) -> str:
         f"🧩 <b>Шарды (MePoolMux)</b>",
         HR,
         f"{mode_icon} mode: {mode_label}",
+        "<i>(API fallback: данные из /proc/net/tcp, не из telemt API)</i>",
     ]
     if err:
         rows.append(f"<i>⚠️ {esc(err)} — config undetected, showing live only</i>")
@@ -985,9 +1076,6 @@ def cmd_shards(_: str) -> str:
         f"  configured: <b>{cfg_n}</b> bind addresses · live: <b>{live_n}</b> active source IPs"
     )
     if mode == "shard" and cfg_n != live_n and cfg_n > 0:
-        # Shard mode declared N but we only see fewer source IPs in flight
-        # → likely one or more shards failed init (check journalctl for
-        # spawn_shard_supervisor retries) or are idle.
         rows.append(
             f"  <i>⚠️ только {live_n}/{cfg_n} shards активны — проверь journalctl</i>"
         )
@@ -998,7 +1086,6 @@ def cmd_shards(_: str) -> str:
         )
         return "\n".join(rows)
 
-    # Per-shard table with visual bar relative to busiest.
     busiest = max(counts.values()) if counts else 1
     rows.append("")
     rows.append("<pre>")
@@ -1010,25 +1097,29 @@ def cmd_shards(_: str) -> str:
     rows.append(f"{'TOTAL':<18} {total:>6}")
     rows.append("</pre>")
 
-    # Balance verdict — the operator's actionable signal.
+    rows.append(_balance_verdict_line(cv))
+    return "\n".join(rows)
+
+
+def _balance_verdict_line(cv: Optional[float]) -> str:
+    """Translate coefficient-of-variation into the operator-facing
+    verdict. Shared between API and /proc paths so both renderers
+    produce identical messaging."""
     if cv is None:
-        rows.append("<i>(нужно ≥2 source IP для оценки баланса)</i>")
-    elif cv < 0.10:
-        rows.append(f"<i>✓ баланс отличный (CV={cv:.2%})</i>")
-    elif cv < 0.25:
-        rows.append(f"<i>✓ баланс ОК (CV={cv:.2%})</i>")
-    elif cv < 0.50:
-        rows.append(
+        return "<i>(нужно ≥2 шарда для оценки баланса)</i>"
+    if cv < 0.10:
+        return f"<i>✓ баланс отличный (CV={cv:.2%})</i>"
+    if cv < 0.25:
+        return f"<i>✓ баланс ОК (CV={cv:.2%})</i>"
+    if cv < 0.50:
+        return (
             f"<i>⚠️ дисбаланс (CV={cv:.2%}) — один shard может квантировать endpoint, "
             f"сиблинги нет</i>"
         )
-    else:
-        rows.append(
-            f"<i>🔴 сильный дисбаланс (CV={cv:.2%}) — shard вероятно сломан, "
-            f"смотри journalctl на flap warns</i>"
-        )
-
-    return "\n".join(rows)
+    return (
+        f"<i>🔴 сильный дисбаланс (CV={cv:.2%}) — shard вероятно сломан, "
+        f"смотри journalctl на flap warns</i>"
+    )
 
 
 def cmd_refresh(_: str) -> str:
