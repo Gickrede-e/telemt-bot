@@ -299,6 +299,9 @@ def main_menu() -> Dict[str, Any]:
             ],
             [
                 {"text": "🌐 DC", "callback_data": "dc"},
+                {"text": "🌐📋 All DCs", "callback_data": "dcall"},
+            ],
+            [
                 {"text": "🔌 ME pool", "callback_data": "me"},
             ],
             [
@@ -432,6 +435,8 @@ def cmd_help(_: str) -> str:
         "<b>Текстовые команды</b> — для конкретики:\n\n"
         "  <code>/user &lt;name&gt;</code> — детали по пользователю + первые 8 IP\n"
         "  <code>/metric &lt;name&gt;</code> — любая Prometheus-метрика\n"
+        "  <code>/dc</code> — компактная таблица по DC; <code>/dc &lt;N&gt;</code> — детали одного DC\n"
+        "  <code>/dcall</code> — полный блок по КАЖДОМУ DC в одном ответе\n"
         "  <code>/ips</code> — распределение outbound по source IP\n"
         "  <code>/shards</code> — режим шардирования + balance check (Phase 2)\n"
         "  <code>/menu</code> — показать главное меню\n"
@@ -624,6 +629,29 @@ def _cmd_dc_detail(target: int) -> str:
     if not dc:
         return f"❌ DC <code>{target}</code> не найден"
 
+    # Single-DC view fetches writers separately; reuse the shared
+    # renderer so format stays identical to /dcall per-DC blocks.
+    try:
+        writers_data = api("/v1/stats/me-writers")
+        dc_writers = [
+            w for w in writers_data.get("writers", []) if w.get("dc") == target
+        ]
+    except Exception:
+        dc_writers = []
+
+    return _render_dc_full_block(dc, dc_writers, include_writer_table=True)
+
+
+def _render_dc_full_block(
+    dc: Dict[str, Any],
+    dc_writers: List[Dict[str, Any]],
+    include_writer_table: bool,
+) -> str:
+    """Single-DC block used by both `/dc <num>` (with top-writer table)
+    and `/dcall` (without — too large × 12 DCs). The first 4 sections
+    (header / stats / endpoint list) match between the two so muscle
+    memory transfers."""
+    target = dc.get("dc", 0)
     icon, label = _dc_health(dc)
     cov = dc.get("coverage_pct", 0)
     fresh = dc.get("fresh_coverage_pct", 0)
@@ -635,13 +663,6 @@ def _cmd_dc_detail(target: int) -> str:
     f_tgt = dc.get("floor_target", 0)
     f_max = dc.get("floor_max", 0)
     cap = " 🔒" if dc.get("floor_capped") else ""
-
-    # Per-writer drilldown — need separate query.
-    try:
-        writers_data = api("/v1/stats/me-writers")
-        dc_writers = [w for w in writers_data.get("writers", []) if w.get("dc") == target]
-    except Exception:
-        dc_writers = []
 
     total_clients = sum(w.get("bound_clients", 0) for w in dc_writers)
 
@@ -661,7 +682,10 @@ def _cmd_dc_detail(target: int) -> str:
 
     # Endpoints with their writer count.
     eps = dc.get("endpoints", []) or []
-    ep_w = {e["endpoint"]: e.get("active_writers", 0) for e in dc.get("endpoint_writers", []) or []}
+    ep_w = {
+        e["endpoint"]: e.get("active_writers", 0)
+        for e in dc.get("endpoint_writers", []) or []
+    }
     if eps:
         lines.append("<b>Endpoints</b>")
         lines.append("<pre>")
@@ -669,11 +693,12 @@ def _cmd_dc_detail(target: int) -> str:
             lines.append(f"{ep:<25} {ep_w.get(ep, 0):>3} writers")
         lines.append("</pre>")
 
-    # Top writers by client count.
-    if dc_writers:
+    # Top writers by client count — only on `/dc <num>` drill-down.
+    # `/dcall` skips this because 12 DCs × 10 writers each blows past
+    # Telegram's per-message limit even with chunking.
+    if include_writer_table and dc_writers:
         lines.append(f"<b>Writers</b> ({len(dc_writers)})")
         lines.append("<pre>")
-        # Truncate endpoint to fit narrow mobile screens.
         for w in sorted(dc_writers, key=lambda x: -x.get("bound_clients", 0))[:10]:
             ep = (w.get("endpoint", "") or "")[:22]
             rtt_ema = w.get("rtt_ema_ms") or 0
@@ -686,6 +711,64 @@ def _cmd_dc_detail(target: int) -> str:
         lines.append("</pre>")
 
     return "\n".join(lines)
+
+
+def cmd_dcall(_: str) -> str:
+    """Per-DC detail block for EVERY DC in one message.
+
+    `/dc` (compact table) is best when you want "are any DCs sick?";
+    `/dcall` is best when you want the full picture per DC without
+    drilling into each one separately. Shares the per-DC renderer with
+    `/dc <num>` so the format is identical — only difference is that
+    `/dcall` skips the top-writers table (too large × 12 DCs).
+    """
+    dcs_data = api("/v1/stats/dcs")
+    if not dcs_data.get("middle_proxy_enabled"):
+        return f"🚫 middle proxy off: {esc(dcs_data.get('reason','?'))}"
+
+    # One fetch, scoped per-DC inline. Avoids per-DC API roundtrips.
+    try:
+        writers_data = api("/v1/stats/me-writers")
+        writers_by_dc: Dict[int, List[Dict[str, Any]]] = {}
+        for w in writers_data.get("writers", []):
+            writers_by_dc.setdefault(w.get("dc", 0), []).append(w)
+    except Exception:
+        writers_by_dc = {}
+
+    dcs = list(dcs_data.get("dcs", []))
+    # Sort by DC id ascending so the order is predictable across
+    # invocations — operators scrolling want the same DC in the same
+    # place each time. (`/dc` sorts by load; `/dcall` sorts by id.)
+    dcs.sort(key=lambda d: d.get("dc", 0))
+
+    total_writers = sum(d.get("alive_writers", 0) for d in dcs)
+    total_required = sum(d.get("required_writers", 0) for d in dcs)
+    total_clients = sum(
+        sum(w.get("bound_clients", 0) for w in ws)
+        for ws in writers_by_dc.values()
+    )
+
+    blocks = [
+        f"🌐 <b>All DC details</b>",
+        (
+            f"<i>{len(dcs)} DCs · {fmt_num(total_writers)} writers "
+            f"({fmt_num(total_required)} required) · "
+            f"{fmt_num(total_clients)} clients</i>"
+        ),
+        "",
+    ]
+    for dc in dcs:
+        dc_id = dc.get("dc", 0)
+        blocks.append(
+            _render_dc_full_block(
+                dc,
+                writers_by_dc.get(dc_id, []),
+                include_writer_table=False,
+            )
+        )
+        blocks.append("")  # blank line between DCs for visual separation
+
+    return "\n".join(blocks)
 
 
 def cmd_me(_: str) -> str:
@@ -1151,6 +1234,7 @@ COMMANDS: Dict[str, Callable[[str], str]] = {
     "/help": cmd_help,
     "/status": cmd_status,
     "/dc": cmd_dc,
+    "/dcall": cmd_dcall,
     "/me": cmd_me,
     "/shards": cmd_shards,
     "/users": cmd_users,
@@ -1167,6 +1251,7 @@ CALLBACK_TO_CMD: Dict[str, str] = {
     "help": "/help",
     "status": "/status",
     "dc": "/dc",
+    "dcall": "/dcall",
     "me": "/me",
     "shards": "/shards",
     "users": "/users",

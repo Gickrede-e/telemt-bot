@@ -49,7 +49,9 @@ fresh     100.0% ████████████
 |---|---|
 | `/menu` | Inline-keyboard main menu |
 | `/status` | Version, uptime, ready state, active connections, **shard mode**, accept-permit-timeout |
-| `/dc` | Per-DC connectivity: writers, coverage, RTT, load |
+| `/dc` | Compact per-DC table: id, RTT, writers, clients, health icon |
+| `/dc <num>` | Detail view of one DC: floor, coverage, endpoints, top writers |
+| `/dcall` | **Full** detail block for every DC in one response (no drill-down needed) |
 | `/me` | Middle-proxy pool: writers, endpoints, hardswaps, quarantines (aggregated across shards) |
 | `/shards` | Per-source-IP shard topology + balance check (telemt Phase 2 MePoolMux) |
 | `/ips` | Outbound source-IP distribution from `/proc/net/tcp` |
